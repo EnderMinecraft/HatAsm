@@ -25,9 +25,17 @@ SOFTWARE.
 import os
 import codecs
 
-from keystone import *
+from keystone import Ks, KsError
+from keystone import (
+    KS_ARCH_X86, KS_MODE_32, KS_MODE_64,
+    KS_ARCH_PPC, KS_MODE_BIG_ENDIAN,
+    KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN,
+    KS_ARCH_ARM, KS_MODE_ARM, KS_MODE_THUMB,
+    KS_ARCH_SPARC, KS_MODE_SPARC32, KS_MODE_SPARC64,
+    KS_ARCH_MIPS, KS_MODE_MIPS64, KS_MODE_MIPS32,
+    KS_OPT_SYNTAX_INTEL, KS_OPT_SYNTAX_ATT
+)
 from capstone import *
-
 from typing import Union
 from badges import Badges
 
@@ -91,6 +99,14 @@ class ASM(Badges):
         'att': CS_OPT_SYNTAX_ATT
     }
 
+    @staticmethod
+    def _ensure_terminator(code: str) -> str:
+        # Keystone can hang/freeeze on some directive/data inputs if the stream
+        # doesn't look "terminated" to its parser. Guarantee a newline.
+        if not code.endswith('\n'):
+            code += '\n'
+        return code
+
     def assemble(self, arch: str, code: str, mode: str = '', syntax: str = 'intel') -> bytes:
         """ Assemble code for the specified architecture.
 
@@ -101,32 +117,55 @@ class ASM(Badges):
         :return bytes: assembled code for the specified architecture
         """
 
-        if arch in self.ks_arch:
-            target = list(self.ks_arch[arch])
+        if arch not in self.ks_arch:
+            return b''
 
-            if arch == 'armle' and mode == 'thumb':
-                target[1] = KS_MODE_THUMB + KS_MODE_LITTLE_ENDIAN
-            elif arch == 'armbe' and mode == 'thumb':
-                target[1] = KS_MODE_THUMB + KS_MODE_BIG_ENDIAN
+        target = list(self.ks_arch[arch])
 
-            ks = Ks(*target)
+        if arch == 'armle' and mode == 'thumb':
+            target[1] = KS_MODE_THUMB + KS_MODE_LITTLE_ENDIAN
+        elif arch == 'armbe' and mode == 'thumb':
+            target[1] = KS_MODE_THUMB + KS_MODE_BIG_ENDIAN
 
-            if syntax in self.ks_syntax:
-                try:
-                    ks.syntax = self.ks_syntax[syntax]
-                except BaseException:
-                    ks = Ks(*target)
+        ks = Ks(*target)
 
-            machine = ks.asm(
-                Preprocessor(arch).preprocess(code).encode())
+        if syntax in self.ks_syntax:
+            try:
+                ks.syntax = self.ks_syntax[syntax]
+            except Exception:
+                # Keystone may reject syntax set depending on build;
+                # keep a safe fallback instance.
+                ks = Ks(*target)
+
+        try:
+            processed = Preprocessor(arch).preprocess(code)
+            processed = self._ensure_terminator(processed)
+
+            # IMPORTANT: pass a terminated string (not a partial stream).
+            machine, _count = ks.asm(processed)
 
             if machine:
-                return bytes(machine[0])
-        return b''
+                return bytes(machine)
+
+            return b''
+
+        except KsError as e:
+            # Clean, deterministic error surface (avoid weird hangs bubbling up).
+            # Example: "Invalid mnemonic (KS_ERR_ASM_MNEMONICFAIL)"
+            msg = str(e).split(' (', 1)[0]
+            raise RuntimeError(msg)
+
+        except Exception as e:
+            # Non-keystone errors (preprocessor, etc.)
+            msg = str(e).split(' (', 1)[0]
+            raise RuntimeError(msg)
 
     def recursive_assemble(self, arch: str, lines: list, mode: str = "",
                            syntax: str = 'intel') -> Union[bytes, dict]:
         """ Assemble each entry of a list for the specified architecture.
+
+        NOTE: kept for compatibility (file-mode error reporting),
+        but interactive console must not use this for label/directive blocks.
 
         :param str arch: architecture to assemble for
         :param list lines: list of code entries to assemble
@@ -173,12 +212,11 @@ class ASM(Badges):
 
                 except Exception as e:
                     print(str(e))
-                    errors = self.recursive_assemble(arch, code.split('\n'), mode)
+                    errors = self.recursive_assemble(arch, code.split('\n'), mode, syntax)
 
                     if isinstance(errors, dict):
                         for line in errors:
                             self.print_error(f"HatAsm: line {str(line)}: {errors[line]}")
-
                     else:
                         return errors
         else:
@@ -209,7 +247,7 @@ class ASM(Badges):
             if syntax in self.cs_syntax:
                 try:
                     cs.syntax = self.cs_syntax[syntax]
-                except BaseException:
+                except Exception:
                     cs = Cs(*target)
 
             assembly = []
@@ -224,7 +262,7 @@ class ASM(Badges):
         """ Disassemble each line of a source file for the specified architecture
         and print result to stdout.
 
-        :param str arch: architecture to disassembler for
+        :param str arch: architecture to disassemble for
         :param str filename: name of a file to disassemble from
         :param str mode: special disassembler mode
         :param str syntax: special disassembler syntax
@@ -241,30 +279,82 @@ class ASM(Badges):
         return []
 
     @staticmethod
-    def hexdump(code: bytes, length: int = 16, sep: str = '.') -> list:
+    def hexdump(code: bytes, length: int = 16, sep: str = '.', badchars: bytes = b"\x00\x0a\x0d") -> list:
         """ Dump assembled code as hex.
+
+        Additionally highlights bad characters using ColorScript tags:
+        - Hex bytes equal to any value in `badchars` are wrapped with %red..%end
+        - ASCII printable chars equal to badchars are also wrapped
 
         :param bytes code: assembled code to dump as hex
         :param int length: length of each string
         :param str sep: non-printable chars replacement
+        :param bytes badchars: bytes considered "bad" (default: NUL, LF, CR)
         :return list: list of hexdump strings
         """
 
         src = code
+        bad = set(badchars)
+
+        # Build printable filter (same as before)
         filt = ''.join([(len(repr(chr(x))) == 3) and chr(x) or sep for x in range(256)])
         lines = []
 
         for c in range(0, len(src), length):
             chars = src[c: c + length]
-            hex_ = ' '.join(['{:02x}'.format(x) for x in chars])
 
-            if len(hex_) > 24:
-                hex_ = '{} {}'.format(hex_[:24], hex_[24:])
+            # Hex column with bad-byte highlighting
+            hex_tokens = []
+            for b in chars:
+                token = f"{b:02x}"
+                if b in bad:
+                    token = f"%red{token}%end"
+                hex_tokens.append(token)
 
-            printable = ''.join(['{}'.format((x <= 127 and filt[x]) or sep) for x in chars])
-            lines.append('{0:08x}  {1:{2}s} |{3:{4}s}|'.format(c, hex_, length * 3, printable, length))
+            hex_ = ' '.join(hex_tokens)
+
+            # Keep the “split after 8 bytes” formatting like original
+            # BUT do it based on tokens count, not string length (since markup increases length)
+            if len(hex_tokens) > 8:
+                hex_ = ' '.join(hex_tokens[:8]) + ' ' + ' '.join(hex_tokens[8:])
+
+            # ASCII column with bad-byte highlighting (only for printable chars)
+            printable_chars = []
+            for b in chars:
+                ch = filt[b] if b <= 127 else sep  # keep original behavior
+                if b in bad and ch != sep:
+                    ch = f"%red{ch}%end"
+                printable_chars.append(ch)
+
+            printable = ''.join(printable_chars)
+
+            # Keep padding aligned: we pad based on raw bytes count (not markup length)
+            # Hex field width: length * 3 + 1 when split, matching original format intent
+            # We'll compute a safe width that accommodates the middle split.
+            # Original used: {1:{2}s} with {2} = length*3
+            # We keep that, but we need to pad ourselves because markup breaks format width.
+            # So: build a padded hex field using the raw token lengths WITHOUT markup.
+            #
+            # Compute visible width of hex field:
+            # - each byte token visible width is 2
+            # - separators are spaces: (n-1) spaces plus one extra split space after 8 bytes if applicable
+            n = len(chars)
+            visible_hex_width = 0
+            if n:
+                visible_hex_width = n * 2 + (n - 1)  # token chars + spaces
+                if n > 8:
+                    visible_hex_width += 1  # extra split space
+
+            target_visible_width = length * 3  # same as old formatter expectation
+
+            # Add trailing spaces to hex_ (pad on the right) based on visible width
+            if visible_hex_width < target_visible_width:
+                hex_ = hex_ + (' ' * (target_visible_width - visible_hex_width))
+
+            lines.append('{0:08x}  {1} |{2:{3}s}|'.format(c, hex_, printable, length))
 
         return lines
+
 
     def hexdump_asm(self, arch: str, code: bytes, mode: str = '', syntax: str = 'intel',
                     length: int = 16, sep: str = '.') -> list:

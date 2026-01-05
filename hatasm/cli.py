@@ -90,11 +90,11 @@ class HatAsmCLI(HatAsm, Tables):
 
         if self.args.asm and self.args.arch:
             if self.args.arch not in self.ks_arch:
-                self.print_error(f"HatAsm: assembler failed: unsupported architecture")
+                self.print_error("HatAsm: assembler failed: unsupported architecture")
                 return
         else:
             if self.args.arch not in self.cs_arch:
-                self.print_error(f"HatAsm: disassembler failed: unsupported architecture")
+                self.print_error("HatAsm: disassembler failed: unsupported architecture")
                 return
 
         if self.args.asm and self.args.input:
@@ -154,5 +154,6 @@ def main() -> None:
     try:
         cli = HatAsmCLI()
         cli.start()
-    except BaseException as e:
+    except Exception as e:
+        # Avoid catching BaseException (KeyboardInterrupt/SystemExit/etc.)
         print(e)
