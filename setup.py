@@ -47,7 +47,7 @@ setup(name='hatasm',
           'pyelftools',
           'capstone',
           'keystone-engine',
-          'badges @ git+https://github.com/EntySec/Badges'
+          'badges @ git+https://github.com/EnderMinecraft/Badges'
       ],
       zip_safe=False
       )
